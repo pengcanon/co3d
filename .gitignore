@@ -1,2 +1,4 @@
 *.egg-info/
 **/__pycache__/
+co3d/dataset
+.idea
