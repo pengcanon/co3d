@@ -113,15 +113,14 @@ def main():
         img_path_abs = os.path.join(args.output_dir, img_path_rel)
         Image.fromarray(color).save(img_path_abs, quality=95)
         
-        # Depth (16-bit png usually, or saved as raw float if needed, but CO3D uses png)
-        # CO3D depth is stored as png with a scale adjustment.
-        # We'll store depth in millimeters as uint16 for precision, or just use the float directly if we were using .npy
-        # But CO3D spec says: "path to png file... storing depth / scale_adjustment"
-        # Let's define scale_adjustment such that max depth fits in uint16.
-        max_depth = np.max(depth)
-        if max_depth == 0: max_depth = 1.0
-        scale_adjustment = max_depth / 65535.0
-        depth_uint16 = (depth / scale_adjustment).astype(np.uint16)
+        # Depth - CO3D uses float16 values stored in 16-bit PNG format
+        # The depth is stored as: depth_png = depth_metric / scale_adjustment
+        # We use scale_adjustment = 1.0 and store depth directly as float16
+        scale_adjustment = 1.0
+        
+        # Convert depth to float16, then reinterpret as uint16 for PNG storage
+        depth_float16 = depth.astype(np.float16)
+        depth_uint16 = np.frombuffer(depth_float16.tobytes(), dtype=np.uint16).reshape(depth.shape)
         
         depth_path_rel = os.path.join(args.category, args.sequence_name, "depths", f"{filename_base}.png")
         depth_path_abs = os.path.join(args.output_dir, depth_path_rel)
@@ -149,7 +148,7 @@ def main():
         focal_length_px = (args.image_size / 2.0) / np.tan(yfov / 2.0)
         
         # NDC conversion for CO3D
-        # "ndc_norm_image_bounds": [-1, 1] x [-1, 1]
+        # For square images, ndc_isotropic is the same as normalizing by half image size
         # focal_length_ndc = focal_length_px / (image_size / 2)
         focal_length_ndc = focal_length_px / (args.image_size / 2.0)
         
@@ -178,7 +177,7 @@ def main():
                 "T": T,
                 "focal_length": [focal_length_ndc, focal_length_ndc],
                 "principal_point": principal_point_ndc,
-                "intrinsics_format": "ndc_norm_image_bounds"
+                "intrinsics_format": "ndc_isotropic"
             }
         }
         frame_annotations.append(frame_ann)

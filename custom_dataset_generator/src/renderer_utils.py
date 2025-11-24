@@ -127,10 +127,8 @@ def get_co3d_viewpoint(camera_pose_gl):
     """
     Convert an OpenGL camera pose (Camera-to-World) to CO3D viewpoint format.
     
-    CO3D Format:
-    - Camera: PyTorch3D convention (+X Left, +Y Up, +Z Forward)
-    - World: COLMAP convention (+Y Down)
-    - Storage: R (Row-Major), T (Translation)
+    CO3D/PyTorch3D uses: X_cam = X_world @ R + T (row vectors)
+    Where R is 3x3 with det(R) = +1 (proper rotation)
     
     Args:
         camera_pose_gl: 4x4 OpenGL Camera-to-World matrix
@@ -140,41 +138,33 @@ def get_co3d_viewpoint(camera_pose_gl):
         T: 3-element Translation vector (list)
     """
     # 1. Invert to get World-to-Camera (OpenGL)
-    w2c_gl = np.linalg.inv(camera_pose_gl)
+    c2w_gl = camera_pose_gl
+    w2c_gl = np.linalg.inv(c2w_gl)
     
-    # 2. Convert OpenGL w2c to PyTorch3D w2c
-    # OpenGL: +X Right, +Y Up, -Z Forward
-    # PyTorch3D: +X Left, +Y Up, +Z Forward
-    # Transformation: Flip X and Z axes
-    M_gl_to_pt3d = np.array([
-        [-1.0, 0.0, 0.0, 0.0], # Flip X
-        [0.0, 1.0, 0.0, 0.0],  # Keep Y
-        [0.0, 0.0, -1.0, 0.0], # Flip Z
-        [0.0, 0.0, 0.0, 1.0]
-    ])
-    w2c_pt3d = M_gl_to_pt3d @ w2c_gl
+    # Extract rotation and translation
+    R_w2c_gl = w2c_gl[:3, :3]  # World to camera rotation (OpenGL)
+    T_w2c_gl = w2c_gl[:3, 3]    # Translation
     
-    # 3. Handle World Coordinate System
-    # CO3D uses a Y-Down World (COLMAP). Our renderer uses Y-Up.
-    # We need to flip the World Y axis.
-    # x_cam = R_pt3d @ x_world_up + T_pt3d
-    # We want: x_cam = R_co3d @ x_world_down + T_co3d
-    # Relation: x_world_up = F @ x_world_down, where F = diag(1, -1, 1)
-    # Subst: x_cam = R_pt3d @ (F @ x_world_down) + T_pt3d
-    # x_cam = (R_pt3d @ F) @ x_world_down + T_pt3d
-    # So R_co3d = R_pt3d @ F
-    # T_co3d = T_pt3d
+    # 2. Convert coordinate systems
+    # OpenGL camera: +X right, +Y up, -Z forward
+    # PyTorch3D camera: +X LEFT, +Y up, +Z forward
+    # Change of basis for camera coordinates: flip X and Z
+    S_cam = np.diag([-1.0, 1.0, -1.0])
     
-    R_col = w2c_pt3d[:3, :3]
-    T_col = w2c_pt3d[:3, 3]
+    # OpenGL world: +Y up
+    # PyTorch3D world: +Y up (same)
+    # No world coordinate change needed
     
-    F = np.diag([1.0, -1.0, 1.0])
-    R_co3d_col = R_col @ F
+    # Transform: X_cam_pt3d = S_cam @ X_cam_gl
+    # For world-to-camera: X_cam_pt3d = S_cam @ R_w2c_gl @ X_world + S_cam @ T_w2c_gl
+    # Since world coords are same: X_cam_pt3d = (S_cam @ R_w2c_gl) @ X_world + (S_cam @ T_w2c_gl)
+    R_w2c_pt3d_colmajor = S_cam @ R_w2c_gl
+    T_w2c_pt3d = S_cam @ T_w2c_gl
     
-    # 4. Convert to Row-Major for storage
-    # PyTorch3D/CO3D stores R as Row-Major (which is the transpose of the rotation matrix if we use column vectors)
-    # But wait, PyTorch3D docs say: X_cam = X_world @ R + T
-    # This R is exactly the transpose of our R_co3d_col.
-    R_row = R_co3d_col.T
+    # 3. Convert to row-major format
+    # Column-major: X_cam = R @ X_world + T (column vectors)
+    # Row-major: X_cam = X_world @ R + T (row vectors)
+    # These are related by transpose: R_row = R_col.T
+    R_w2c_pt3d_rowmajor = R_w2c_pt3d_colmajor.T
     
-    return R_row.tolist(), T_col.tolist()
+    return R_w2c_pt3d_rowmajor.tolist(), T_w2c_pt3d.tolist()
