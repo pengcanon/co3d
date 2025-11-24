@@ -1,0 +1,5 @@
+# Ignore assets and output
+assets/
+output/
+__pycache__/
+*.pyc
