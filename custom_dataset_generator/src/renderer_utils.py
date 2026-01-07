@@ -3,17 +3,169 @@ import pyrender
 import trimesh
 import os
 
-def load_model(model_path):
+def normalize_scene_geometry(scene_or_mesh, target_scale=1.0):
+    """
+    Centers the mesh/scene at origin and scales it to fit within a unit sphere (or box).
+    
+    Args:
+        scene_or_mesh: trimesh.Scene or trimesh.Trimesh object
+        target_scale: The max dimension of the normalized object (default: 1.0)
+    
+    Returns:
+        The normalized scene/mesh object
+        norm_metrics: dict containing 'original_scale', 'scale_factor', 'offset'
+    """
+    bounds = scene_or_mesh.bounds
+    # Calculate extents (size)
+    extents = bounds[1] - bounds[0]
+    max_extent = np.max(extents)
+    
+    # Calculate scale factor to make max_extent == target_scale
+    if max_extent <= 1e-6:
+        scale_factor = 1.0
+    else:
+        scale_factor = target_scale / max_extent
+        
+    # Calculate translation to center
+    centroid = scene_or_mesh.centroid
+    translation = -centroid
+    
+    # Create transform matrices
+    # 1. Translate to origin
+    T_center = np.eye(4)
+    T_center[:3, 3] = translation
+    
+    # 2. Scale
+    S = np.eye(4)
+    S[:3, :3] *= scale_factor
+    
+    # Combined Transform: Scale * Translate (Translate first, then Scale)
+    T_final = S @ T_center
+    
+    # Apply transform
+    scene_or_mesh.apply_transform(T_final)
+    
+    print(f"[Normalization] Original Scale (Max Dim): {max_extent:.4f}")
+    print(f"[Normalization] Applied Scale Factor: {scale_factor:.4f}")
+    print(f"[Normalization] New Scale (Max Dim): {target_scale:.4f}")
+    
+    return scene_or_mesh, {
+        "scale_factor": scale_factor,
+        "offset": translation,
+        "original_max_dim": max_extent
+    }
+
+def load_model(model_path, normalize=False, scale_adjustment=1.0):
     """
     Load a 3D model (GLB/GLTF/OBJ) into a pyrender Scene.
+    
+    Args:
+        model_path: Path to the 3D model file
+        normalize: If True, centers the model and scales it to fit in a unit cube.
+        scale_adjustment: Manual scaling factor to apply to the model (default: 1.0)
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     # trimesh handles loading and texture resolution
-    trimesh_scene = trimesh.load(model_path)
+    trimesh_scene = trimesh.load(model_path, process=False)
     
+    # Custom Scaling (Manual)
+    if scale_adjustment != 1.0:
+        print(f"[Custom Scale] Applying manual scale factor: {scale_adjustment}")
+        matrix = np.eye(4)
+        matrix[:3, :3] *= scale_adjustment
+        trimesh_scene.apply_transform(matrix)
+    
+    # Check if texture is loaded correctly. 
+    # For OBJs without MTL or failing to resolve, we might need to manually load texture.
+    # Heuristic: look for a texture file with similar name in the same directory.
+    if isinstance(trimesh_scene, trimesh.Trimesh):
+        # It's a single mesh
+        meshes = [trimesh_scene]
+    elif isinstance(trimesh_scene, trimesh.Scene):
+        # Use geometry dictionary
+        meshes = list(trimesh_scene.geometry.values())
+    else:
+        meshes = []
+
+    # Try to find a texture file in the same directory if missing
+    # ONLY for OBJs. GLB/GLTF should be self-contained.
+    texture_path = None
+    if model_path.lower().endswith('.obj'):
+        model_dir = os.path.dirname(model_path)
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        
+        # Common texture extensions
+        tex_exts = ['.jpg', '.png', '.jpeg']
+        
+        # 0. Check 'tex' subfolder for diffuse textures (common in some assets)
+        tex_subdir = os.path.join(model_dir, 'tex')
+        if os.path.exists(tex_subdir) and os.path.isdir(tex_subdir):
+            # Look for files containing 'dif' (diffuse)
+            potential_textures = []
+            for f in os.listdir(tex_subdir):
+                if 'dif' in f.lower() and os.path.splitext(f)[1].lower() in tex_exts:
+                    potential_textures.append(os.path.join(tex_subdir, f))
+            
+            # Prefer higher resolution if possible (e.g. 8k over 2k)
+            if potential_textures:
+                # Sort to maybe pick 8k or just pick first
+                # "8k" > "2k"
+                potential_textures.sort(reverse=True) 
+                texture_path = potential_textures[0]
+
+        # 1. Try name match: model_name + .jpg
+        if texture_path is None:
+            for ext in tex_exts:
+                p = os.path.join(model_dir, model_name + ext)
+                if os.path.exists(p):
+                    texture_path = p
+                    break
+                
+        # 2. If not found, try searching for any image file that looks related (e.g. contains 'diffuse', or just share prefix)
+        # Specifically for this case: rp_dennis_posed_004_100k.obj -> rp_dennis_posed_004_A.jpg
+        # They share strict prefix "rp_dennis_posed_004_"
+        if texture_path is None:
+            # Try to match the "base" name (e.g. remove resolution suffix like _100k)
+            # Split by underscore and try to match the prefix
+            parts = model_name.split('_')
+            # Try matching progressively shorter prefixes
+            for i in range(len(parts), 0, -1):
+                prefix = "_".join(parts[:i])
+                # List files in dir
+                for f in os.listdir(model_dir):
+                    if f.startswith(prefix) and os.path.splitext(f)[1].lower() in tex_exts:
+                        texture_path = os.path.join(model_dir, f)
+                        break
+                if texture_path:
+                    break
+
+    if texture_path:
+        from PIL import Image
+        print(f"Loading texture from: {texture_path}")
+        try:
+            image = Image.open(texture_path)
+            # Apply to all meshes that don't have a valid image or have a dummy one
+            for m in meshes:
+                has_valid_texture = False
+                if hasattr(m.visual, 'material') and hasattr(m.visual.material, 'image'):
+                     # Check if it's a dummy 2x2 image (often white/grey placeholder)
+                     if m.visual.material.image is not None and m.visual.material.image.size != (2, 2):
+                         has_valid_texture = True
+                
+                if not has_valid_texture:
+                     # Create a simple material with this texture
+                     m.visual.material = trimesh.visual.material.SimpleMaterial(image=image)
+        except Exception as e:
+            print(f"Failed to load texture: {e}")
+
+    # Normalize if requested
+    if normalize:
+        trimesh_scene, _ = normalize_scene_geometry(trimesh_scene)
+
     if isinstance(trimesh_scene, trimesh.Scene):
+
         scene = pyrender.Scene.from_trimesh_scene(trimesh_scene)
         bounds = trimesh_scene.bounds
         centroid = trimesh_scene.centroid

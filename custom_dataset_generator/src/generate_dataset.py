@@ -20,17 +20,19 @@ def save_jgz(data, path):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate CO3D dataset from 3D model")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the .glb model")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the .glb or .obj model")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for the dataset")
     parser.add_argument("--category", type=str, default="human_body", help="Category name for the dataset")
     parser.add_argument("--sequence_name", type=str, default="sequence_001", help="Sequence name")
     parser.add_argument("--num_views", type=int, default=100, help="Number of views to generate")
     parser.add_argument("--image_size", type=int, default=800, help="Image size (square)")
+    parser.add_argument("--scale_adjustment", type=float, default=1.0, help="Manual scale adjustment factor (default 1.0)")
     
     args = parser.parse_args()
     
     print(f"Generating dataset for {args.model_path}...")
     print(f"Output directory: {args.output_dir}")
+    print(f"Scale Adjustment: {args.scale_adjustment}")
     
     # Setup directories
     seq_dir = os.path.join(args.output_dir, args.category, args.sequence_name)
@@ -44,7 +46,7 @@ def main():
         os.makedirs(d, exist_ok=True)
         
     # Load model
-    scene, bounds, centroid = load_model(args.model_path)
+    scene, bounds, centroid = load_model(args.model_path, normalize=False, scale_adjustment=args.scale_adjustment)
     
     frame_annotations = []
     
