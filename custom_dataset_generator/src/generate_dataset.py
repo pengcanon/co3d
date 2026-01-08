@@ -1,9 +1,17 @@
 import argparse
 import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import sys
 import json
 import gzip
 import numpy as np
+import shutil
+import glob
+import subprocess
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 from PIL import Image
 from tqdm import tqdm
 
@@ -14,10 +22,137 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 # Import renderer utils
 from renderer_utils import load_model, get_camera_pose, render_view, get_co3d_viewpoint
 
+def load_jgz(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with gzip.open(path, 'rt', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load {path}: {e}")
+        return []
+
 def save_jgz(data, path):
     with gzip.open(path, 'wt', encoding='utf-8') as f:
         json.dump(data, f)
 
+def append_and_save_jgz(new_data, path, key_field=None):
+    """
+    Appends new_data (list) to existing data in path.
+    If key_field is provided, it avoids duplicates by checking that field.
+    """
+    existing = load_jgz(path)
+    if not isinstance(existing, list):
+        print(f"Warning: Existing file {path} is not a list. Overwriting.")
+        existing = []
+        
+    if key_field:
+        existing_keys = {item.get(key_field) for item in existing}
+        for item in new_data:
+            if item.get(key_field) not in existing_keys:
+                existing.append(item)
+            else:
+                # Optionally update? For now, skip to preserve existing?
+                # Or replace? CO3D dataset generation usually implies adding new frames.
+                # If we re-run, we might want to update.
+                # Let's simple append new ones. 
+                pass
+    else:
+        existing.extend(new_data)
+        
+    save_jgz(existing, path)
+
+def append_and_save_json(new_data, path):
+    """
+    Appends new_data (list) to existing JSON file.
+    """
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            existing = json.load(f)
+    else:
+        existing = []
+        
+    if not isinstance(existing, list):
+         existing = []
+         
+    existing.extend(new_data)
+    
+    with open(path, 'w') as f:
+        json.dump(existing, f, indent=2)
+
+def process_blender_dataset(args, dirs):
+    """
+    Handle .blend files by invoking Blender in a subprocess.
+    """
+    if cv2 is None:
+        print("Error: OpenCV (cv2) is required to process Blender output (EXR). Please install opencv-python.")
+        return
+
+    print("Detected .blend file. Running Blender pipeline...")
+    
+    # Path to the internal blender script
+    script_path = os.path.join(os.path.dirname(__file__), "blender_script.py")
+    
+    # Check for blender executable
+    blender_exe = args.blender_path
+    
+    # Build command
+    # blender -b file.blend -P script.py -- output_dir num_views image_size scale
+    cmd = [
+        blender_exe,
+        "-b", args.model_path,
+        "-P", script_path,
+        "--",
+        args.output_dir, # We pass root output, script handles images/temp_depth
+        str(args.num_views),
+        str(args.image_size),
+        str(args.scale_adjustment)
+    ]
+    
+    print(f"Running command: {' '.join(cmd)}")
+    
+    # Run Blender
+    try:
+        subprocess.check_call(cmd)
+    except FileNotFoundError:
+        print(f"Error: Blender executable '{blender_exe}' not found. Please specify --blender_path or add to PATH.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Blender failed with error code {e.returncode}")
+        sys.exit(1)
+        
+    print("Blender rendering complete. Processing outputs...")
+    
+    # Load Metadata
+    meta_path = os.path.join(args.output_dir, "metadata.json")
+    if not os.path.exists(meta_path):
+        print("Error: No metadata.json produced by Blender script.")
+        return
+        
+    with open(meta_path, "r") as f:
+        meta_data = json.load(f)
+        
+    frame_annotations = []
+    
+    # Process each frame
+    for meta in tqdm(meta_data):
+        idx = meta['index']
+        filename_base = meta['filename_base'] # e.g. "frame000000"
+        
+        # 1. Move/Verify Image
+        # Blender output: output_dir/images/frame000000.jpg
+        # CO3D expectation: output_dir/category/sequence/images/frame000000.jpg
+        # The args.output_dir passed to Blender was likely just the working dir?
+        # Wait, in main() below, we determine `seq_dir`.
+        # For Blender, we should pass `seq_dir` as the output!
+        # But `process_blender_dataset` receives `args` and `dirs`.
+        pass 
+        # Actually I coded existing `main` to setup `dirs` dict which has absolute paths.
+        # But the `blender_script.py` takes `output_dir` as the first arg and creates `images` inside it.
+        # So in the call above, I should pass `seq_dir`.
+        
+    # CORRECTION: Need to adjust the cmd call to use `seq_dir`
+    
 def main():
     parser = argparse.ArgumentParser(description="Generate CO3D dataset from 3D model")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the .glb or .obj model")
@@ -27,6 +162,8 @@ def main():
     parser.add_argument("--num_views", type=int, default=100, help="Number of views to generate")
     parser.add_argument("--image_size", type=int, default=800, help="Image size (square)")
     parser.add_argument("--scale_adjustment", type=float, default=1.0, help="Manual scale adjustment factor (default 1.0)")
+    parser.add_argument("--blender_path", type=str, default="blender", help="Path to blender executable")
+    parser.add_argument("--num_sequences", type=int, default=1, help="Number of random time sequences to generate (Blender only)")
     
     args = parser.parse_args()
     
@@ -42,15 +179,251 @@ def main():
         "depth_masks": os.path.join(seq_dir, "depth_masks"),
         "masks": os.path.join(seq_dir, "masks"),
     }
-    for d in dirs.values():
-        os.makedirs(d, exist_ok=True)
+    # Only create if NOT blender logic, or use as temp for blender (blender script creates its own)
+    # The new blender logic uses seq_dir as a Root for all sequences? 
+    # Or output_dir/category is the root, and we create sequence folders inside.
+    # User said: "current argument sequence_name should not be used ... each sample time frame will generate dataset under a different sequence name"
+    
+    # So if Blender, we use args.output_dir/args.category as base, and subfolders will be create dynamically.
+    if not args.model_path.lower().endswith('.blend'):
+        for d in dirs.values():
+            os.makedirs(d, exist_ok=True)
+    
+    # Branch for Blender
+    if args.model_path.lower().endswith('.blend'):
+        # Use tempfile to create a truly temporary directory that we control
+        import tempfile
         
-    # Load model
+        # We will use this content manager to ensure cleanup
+        with tempfile.TemporaryDirectory() as temp_build_dir:
+            temp_build_dir = os.path.abspath(temp_build_dir) # Use absolute path for Blender
+            
+            # Build command
+            script_path = os.path.join(os.path.dirname(__file__), "blender_script.py")
+            cmd = [
+                args.blender_path,
+                "-b", args.model_path,
+                "-P", script_path,
+                "--",
+                temp_build_dir, # Blender outputs here
+                str(args.num_views),
+                str(args.image_size),
+                str(args.scale_adjustment),
+                str(args.num_sequences)
+            ]
+            
+            print(f"Running Blender: {' '.join(cmd)}")
+            try:
+                import cv2
+                subprocess.check_call(cmd)
+            except Exception as e:
+                print(f"Blender Execution Error: {e}")
+                return
+
+            # Post-Processing
+            meta_path = os.path.join(temp_build_dir, "metadata.json")
+            if not os.path.exists(meta_path):
+                 print(f"Error: Metadata file not found at {meta_path}. Blender likely failed.")
+                 return
+
+            with open(meta_path, "r") as f:
+                meta_data = json.load(f)
+                
+            all_frame_annotations = []
+            unique_sequences = set()
+            
+            print("Processing Blender outputs...")
+            for meta in tqdm(meta_data):
+                filename_base = meta['filename_base']
+                seq_name = meta['sequence_name'] # e.g. frame_000123
+                
+                # Check if we should override sequence name if num_sequences=1?
+                # For consistency with OBJ pipeline which uses 'sequence_name' arg...
+                # But Blender renders actual animation frames. 
+                # Keeping 'seq_name' from Blender is safer for multi-frame support.
+                
+                unique_sequences.add(seq_name)
+                
+                # Destination folders for this specific sequence
+                # output/category/seq_name/...
+                dest_seq_dir = os.path.join(args.output_dir, args.category, seq_name)
+                dest_dirs = {
+                    "images": os.path.join(dest_seq_dir, "images"),
+                    "depths": os.path.join(dest_seq_dir, "depths"),
+                    "depth_masks": os.path.join(dest_seq_dir, "depth_masks"),
+                    "masks": os.path.join(dest_seq_dir, "masks"),
+                }
+                for d in dest_dirs.values():
+                    os.makedirs(d, exist_ok=True)
+                    
+                # Move/Process Image
+                src_img = os.path.join(temp_build_dir, "images", f"{filename_base}.jpg")
+                dst_img_rel = os.path.join(args.category, seq_name, "images", f"{filename_base}.jpg")
+                dst_img_abs = os.path.join(args.output_dir, dst_img_rel)
+                
+                if os.path.exists(src_img):
+                    shutil.copy(src_img, dst_img_abs)
+                    print(f"  [Image] Copied to: {dst_img_abs}")
+                else:
+                    print(f"Missing image: {src_img}")
+                    continue
+                
+                # Depth Processing
+                temp_depth_dir = os.path.join(temp_build_dir, "temp_depth")
+                
+                # Look for NPY first (New Blender Script)
+                search_pattern_npy = os.path.join(temp_depth_dir, f"{filename_base}*.npy")
+                files = glob.glob(search_pattern_npy)
+                
+                depth_img = None
+                
+                if files:
+                    file_path = files[0]
+                    try:
+                        # Load NPY
+                        depth_img = np.load(file_path)
+                        # NPY is already (H, W) float32
+                        
+                        # Ensure it is 2D
+                        if len(depth_img.shape) == 3:
+                            depth_img = depth_img[:, :, 0]
+                            
+                    except Exception as e:
+                         print(f"NPY read failed: {e}")
+                
+                else:
+                    # Fallback to TIFF/EXR/HDR
+                    possible_exts = [".hdr", ".exr", ".tif", ".tiff"]
+                    files = []
+                    for ext in possible_exts:
+                        search_pattern = os.path.join(temp_depth_dir, f"{filename_base}*{ext}")
+                        files = glob.glob(search_pattern)
+                        if files: break
+                    
+                    if files:
+                        file_path = files[0]
+                        # Attempt to read with OpenCV first
+                        depth_img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                        
+                        if depth_img is None:
+                             print(f"DEBUG: cv2.imread returned None for {file_path}. Trying imageio.")
+                             try:
+                                import imageio.v2 as imageio
+                                depth_img = imageio.imread(file_path)
+                             except Exception as e:
+                                print(f"ImageIO read failed: {e}")
+
+                if depth_img is None:
+                    print(f"Warning: No valid depth file (npy/exr/tif) found for {filename_base}")
+                    continue
+                    
+                # Ensure it is 2D (take Red channel)
+                if len(depth_img.shape) == 3:
+                    depth_img = depth_img[:, :, 0]
+                    
+                depth_map = depth_img
+                # Convert
+
+                    
+                # Convert
+                depth_float16 = depth_map.astype(np.float16)
+                depth_uint16 = np.frombuffer(depth_float16.tobytes(), dtype=np.uint16).reshape(depth_map.shape)
+                
+                dst_depth_rel = os.path.join(args.category, seq_name, "depths", f"{filename_base}.png")
+                dst_depth_abs = os.path.join(args.output_dir, dst_depth_rel)
+                Image.fromarray(depth_uint16).save(dst_depth_abs)
+                
+                # Mask
+                mask = ((depth_map > 0) & (depth_map < 1000.0)).astype(np.uint8) * 255
+                
+                dst_mask_rel = os.path.join(args.category, seq_name, "masks", f"{filename_base}.png")
+                dst_mask_abs = os.path.join(args.output_dir, dst_mask_rel)
+                Image.fromarray(mask).save(dst_mask_abs)
+                
+                dst_dmask_rel = os.path.join(args.category, seq_name, "depth_masks", f"{filename_base}.png")
+                dst_dmask_abs = os.path.join(args.output_dir, dst_dmask_rel)
+                Image.fromarray(mask).save(dst_dmask_abs)
+                
+                # Annotations
+                c2w = np.array(meta['c2w_matrix'])
+                R, T = get_co3d_viewpoint(c2w)
+                
+                # Calculate Focal Length
+                # Prefer metadata values if available (from Blender)
+                if 'focal_length' in meta and 'sensor_width' in meta:
+                    fl_mm = meta['focal_length']
+                    sw_mm = meta['sensor_width']
+                    # Focal length in NDC: fx_ndc = 2 * fl_mm / sw_mm
+                    if sw_mm > 0:
+                        focal_length_ndc = 2.0 * fl_mm / sw_mm
+                    else:
+                        yfov = np.radians(60.0)
+                        focal_length_px = (args.image_size / 2.0) / np.tan(yfov / 2.0)
+                        focal_length_ndc = focal_length_px / (args.image_size / 2.0)
+                else:
+                    yfov = np.radians(60.0)
+                    focal_length_px = (args.image_size / 2.0) / np.tan(yfov / 2.0)
+                    focal_length_ndc = focal_length_px / (args.image_size / 2.0)
+                
+                frame_ann = {
+                    "sequence_name": seq_name,
+                    "frame_number": meta['index'], # Index within SEQUENCE
+                    "frame_timestamp": meta['timestamp'],
+                    "image": {"path": dst_img_rel, "size": [args.image_size, args.image_size]},
+                    "depth": {"path": dst_depth_rel, "scale_adjustment": 1.0, "mask_path": dst_dmask_rel},
+                    "mask": {"path": dst_mask_rel, "mass": float(np.sum(mask) / 255.0)},
+                    "viewpoint": {
+                        "R": R, "T": T,
+                        "focal_length": [focal_length_ndc, focal_length_ndc],
+                        "principal_point": [0.0, 0.0],
+                        "intrinsics_format": "ndc_isotropic"
+                    },
+                    "meta": {"original_frame": meta['frame_number']}
+                }
+                all_frame_annotations.append(frame_ann)
+                
+            # Cleanup - HANDLED BY CONTEXT MANAGER
+            print(f"Debug: cleaned up temp build dir")
+        
+        # Save Annotations
+        print("Saving Blender annotations...")
+        
+        # Frame Annotations (Global for category)
+        ann_path = os.path.join(args.output_dir, args.category, "frame_annotations.jgz")
+        append_and_save_jgz(all_frame_annotations, ann_path)
+        
+        # Sequence Annotations
+        seq_ann_path = os.path.join(args.output_dir, args.category, "sequence_annotations.jgz")
+        seq_ann = []
+        for seq in unique_sequences:
+            seq_ann.append({
+                "sequence_name": seq,
+                "category": args.category,
+                "viewpoint_quality_score": 1.0
+            })
+        append_and_save_jgz(seq_ann, seq_ann_path, key_field="sequence_name")
+        
+        # Update Set Lists
+        set_lists_dir = os.path.join(args.output_dir, args.category, "set_lists")
+        os.makedirs(set_lists_dir, exist_ok=True)
+        
+        set_list_data = []
+        for ann in all_frame_annotations:
+             set_list_data.append((ann["sequence_name"], ann["frame_number"], ann["image"]["path"]))
+             
+        set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")
+        append_and_save_json(set_list_data, set_list_path)
+        
+        print(f"Dataset generation complete (Blender Pipeline). Generated {len(unique_sequences)} sequences.")
+        return
+
+    # Load model (PyRender path)
     scene, bounds, centroid = load_model(args.model_path, normalize=False, scale_adjustment=args.scale_adjustment)
     
     frame_annotations = []
     
     # Calculate optimal camera distance
+
     # bounds is 2x3 [[min_x, min_y, min_z], [max_x, max_y, max_z]]
     extents = bounds[1] - bounds[0]
     max_extent = np.max(extents)
@@ -185,12 +558,10 @@ def main():
         frame_annotations.append(frame_ann)
 
     # Save Frame Annotations
-    # CO3D stores all frame annotations for a category in one file usually, 
-    # but here we are generating a single sequence.
-    # We will save it in the category folder.
+    # CO3D stores all frame annotations for a category in one file usually.
     cat_dir = os.path.join(args.output_dir, args.category)
     frame_ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
-    save_jgz(frame_annotations, frame_ann_path)
+    append_and_save_jgz(frame_annotations, frame_ann_path)
     
     # Save Sequence Annotations
     seq_ann = {
@@ -199,7 +570,7 @@ def main():
         "viewpoint_quality_score": 1.0
     }
     seq_ann_path = os.path.join(cat_dir, "sequence_annotations.jgz")
-    save_jgz([seq_ann], seq_ann_path)
+    append_and_save_jgz([seq_ann], seq_ann_path, key_field="sequence_name")
     
     # Create Set Lists (train/val split)
     # We'll put all frames in 'manyview_dev_0' for simplicity
@@ -212,8 +583,7 @@ def main():
     ]
     
     set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")
-    with open(set_list_path, 'w') as f:
-        json.dump(set_list_data, f)
+    append_and_save_json(set_list_data, set_list_path)
         
     print("Dataset generation complete!")
 
