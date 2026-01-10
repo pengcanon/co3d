@@ -80,79 +80,6 @@ def append_and_save_json(new_data, path):
     with open(path, 'w') as f:
         json.dump(existing, f, indent=2)
 
-def process_blender_dataset(args, dirs):
-    """
-    Handle .blend files by invoking Blender in a subprocess.
-    """
-    if cv2 is None:
-        print("Error: OpenCV (cv2) is required to process Blender output (EXR). Please install opencv-python.")
-        return
-
-    print("Detected .blend file. Running Blender pipeline...")
-    
-    # Path to the internal blender script
-    script_path = os.path.join(os.path.dirname(__file__), "blender_script.py")
-    
-    # Check for blender executable
-    blender_exe = args.blender_path
-    
-    # Build command
-    # blender -b file.blend -P script.py -- output_dir num_views image_size scale
-    cmd = [
-        blender_exe,
-        "-b", args.model_path,
-        "-P", script_path,
-        "--",
-        args.output_dir, # We pass root output, script handles images/temp_depth
-        str(args.num_views),
-        str(args.image_size),
-        str(args.scale_adjustment)
-    ]
-    
-    print(f"Running command: {' '.join(cmd)}")
-    
-    # Run Blender
-    try:
-        subprocess.check_call(cmd)
-    except FileNotFoundError:
-        print(f"Error: Blender executable '{blender_exe}' not found. Please specify --blender_path or add to PATH.")
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"Blender failed with error code {e.returncode}")
-        sys.exit(1)
-        
-    print("Blender rendering complete. Processing outputs...")
-    
-    # Load Metadata
-    meta_path = os.path.join(args.output_dir, "metadata.json")
-    if not os.path.exists(meta_path):
-        print("Error: No metadata.json produced by Blender script.")
-        return
-        
-    with open(meta_path, "r") as f:
-        meta_data = json.load(f)
-        
-    frame_annotations = []
-    
-    # Process each frame
-    for meta in tqdm(meta_data):
-        idx = meta['index']
-        filename_base = meta['filename_base'] # e.g. "frame000000"
-        
-        # 1. Move/Verify Image
-        # Blender output: output_dir/images/frame000000.jpg
-        # CO3D expectation: output_dir/category/sequence/images/frame000000.jpg
-        # The args.output_dir passed to Blender was likely just the working dir?
-        # Wait, in main() below, we determine `seq_dir`.
-        # For Blender, we should pass `seq_dir` as the output!
-        # But `process_blender_dataset` receives `args` and `dirs`.
-        pass 
-        # Actually I coded existing `main` to setup `dirs` dict which has absolute paths.
-        # But the `blender_script.py` takes `output_dir` as the first arg and creates `images` inside it.
-        # So in the call above, I should pass `seq_dir`.
-        
-    # CORRECTION: Need to adjust the cmd call to use `seq_dir`
-    
 def main():
     parser = argparse.ArgumentParser(description="Generate CO3D dataset from 3D model")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the .glb or .obj model")
@@ -185,11 +112,6 @@ def main():
     # User said: "current argument sequence_name should not be used ... each sample time frame will generate dataset under a different sequence name"
     
     # So if Blender, we use args.output_dir/args.category as base, and subfolders will be create dynamically.
-    if not args.model_path.lower().endswith('.blend'):
-        for d in dirs.values():
-            os.makedirs(d, exist_ok=True)
-    
-    # Branch for Blender
     if args.model_path.lower().endswith('.blend'):
         # Use tempfile to create a truly temporary directory that we control
         import tempfile
@@ -198,21 +120,22 @@ def main():
         with tempfile.TemporaryDirectory() as temp_build_dir:
             temp_build_dir = os.path.abspath(temp_build_dir) # Use absolute path for Blender
             
-            # Build command
-            script_path = os.path.join(os.path.dirname(__file__), "blender_script.py")
+            # .blend execution
+            script_name = "blender_script.py"
+            script_path = os.path.join(os.path.dirname(__file__), script_name)
             cmd = [
                 args.blender_path,
                 "-b", args.model_path,
                 "-P", script_path,
                 "--",
-                temp_build_dir, # Blender outputs here
+                temp_build_dir,
                 str(args.num_views),
                 str(args.image_size),
                 str(args.scale_adjustment),
                 str(args.num_sequences)
             ]
             
-            print(f"Running Blender: {' '.join(cmd)}")
+            print(f"Running Blender ({script_name}): {' '.join(cmd)}")
             try:
                 import cv2
                 subprocess.check_call(cmd)
@@ -416,6 +339,10 @@ def main():
         
         print(f"Dataset generation complete (Blender Pipeline). Generated {len(unique_sequences)} sequences.")
         return
+
+    # Create directories for PyRender pipeline
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
 
     # Load model (PyRender path)
     scene, bounds, centroid = load_model(args.model_path, normalize=False, scale_adjustment=args.scale_adjustment)

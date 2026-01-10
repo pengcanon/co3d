@@ -218,6 +218,28 @@ def main():
     # 1.5 Setup Lighting
     setup_lighting()
 
+    # Frame Range
+    frame_start = scene.frame_start
+    frame_end = scene.frame_end
+    
+    # Sample random frames for sequences
+    # If not enough frames, we might duplicate, but usually 4D assets have many frames.
+    available_frames = list(range(frame_start, frame_end + 1))
+    if num_sequences > len(available_frames):
+        # Repetition needed
+        sampled_frames = [random.choice(available_frames) for _ in range(num_sequences)]
+    else:
+        sampled_frames = random.sample(available_frames, num_sequences)
+
+    # Apply Scale Adjustment (Relative)
+    # The original script overwrote scale with (1.0, 1.0, 1.0), breaking imported assets that use 0.01 scale.
+    # We now MULTIPLY existing scale.
+    if scale_adjustment != 1.0:
+        targets = [o for o in bpy.context.scene.objects if looks_like_human(o)]
+        for obj in targets:
+            s = obj.scale
+            obj.scale = (s[0] * scale_adjustment, s[1] * scale_adjustment, s[2] * scale_adjustment)
+
     # 3. Determine Object Center & Size
     # We do this at frame 0 (or start)
     center, size = get_target_center()
@@ -229,47 +251,12 @@ def main():
     cam.data.angle = fov 
     
     dist = (size / 2.0) / math.tan(fov / 2.0)
-    radius = dist * 1.1 * scale_adjustment  # Reduced padding to 1.1 to fill frame better 
-    # Or should we just render correctly and let pipeline scale?
-    # The pipeline 'scale_adjustment' normally scales the MODEL. 
-    # If we can't scale the animated model easily (bones etc), we can scale the WORLD (Camera distance).
-    # IF we scale the MODEL by X, it looks X times bigger, so Radius should stay same? NO.
-    # If Model is 10x bigger, Camera must be 10x further to frame it same.
-    # But user wants depth values to change.
-    
-    # The user manual scaling: "For different training purposes... normalize or scale...".
-    # If we apply scale_adjustment to the object (scale property), depth will change.
-    # A linked Alembic object might be locked?
-    # Let's try scaling the container object.
-    
-    targets = [o for o in bpy.context.scene.objects if looks_like_human(o)]
-    for obj in targets:
-        obj.scale = (scale_adjustment, scale_adjustment, scale_adjustment)
-    
-    # Re-calc center/size after scale
-    center, size = get_target_center()
-    dist = (size / 2.0) / math.tan(fov / 2.0)
-    radius = dist * 1.5
-
-    # Frame Range
-    frame_start = scene.frame_start
-    frame_end = scene.frame_end
-    
-    print(f"Rendering {num_sequences} sequences with {num_views} views each...")
+    radius = dist * 1.5  # Standard margin
     
     # Metadata list
     meta_data = []
 
     global_index = 0
-    
-    # Sample random frames for sequences
-    # If not enough frames, we might duplicate, but usually 4D assets have many frames.
-    available_frames = list(range(frame_start, frame_end + 1))
-    if num_sequences > len(available_frames):
-        # Repetition needed
-        sampled_frames = [random.choice(available_frames) for _ in range(num_sequences)]
-    else:
-        sampled_frames = random.sample(available_frames, num_sequences)
 
     for seq_idx, frame_num in enumerate(sampled_frames):
         # Set the time frame once for this sequence
