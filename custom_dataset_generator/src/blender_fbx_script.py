@@ -14,6 +14,10 @@ def init_scene(output_dir):
     scene.render.engine = 'BLENDER_EEVEE'
     scene.render.image_settings.file_format = 'JPEG'
     scene.render.image_settings.quality = 95
+
+    # Enable Z (Depth) Pass
+    # In a clean scene, this might be off by default
+    bpy.context.view_layer.use_pass_z = True
     
     # Setup Compositor for Depth Output
     scene.use_nodes = True
@@ -35,7 +39,15 @@ def init_scene(output_dir):
     # depth_out.format.color_depth is not relevant for RADIANCE, it's always float-ish
     
     # Link Z (Depth) to Input
-    links.new(rl.outputs['Depth'], depth_out.inputs[0])
+    # Note: socket name can be 'Depth' or 'Z' depending on blender version/settings
+    socket = rl.outputs.get('Depth')
+    if not socket:
+        socket = rl.outputs.get('Z')
+    
+    if socket:
+        links.new(socket, depth_out.inputs[0])
+    else:
+        print(f"Error: Could not find 'Depth' or 'Z' output in Render Layers. Available: {[o.name for o in rl.outputs]}")
     
     return depth_out
 
@@ -112,14 +124,14 @@ def setup_lighting():
     # 1. Strong Key Light (Sun)
     bpy.ops.object.light_add(type='SUN', location=(0, 0, 10))
     sun = bpy.context.object
-    sun.data.energy = 1.5  # Reduced from 30.0 for less contrast
+    sun.data.energy = 1.0  # Reduced to dim the scene
     # Angle it to look down at the center roughly
     sun.rotation_euler = (math.radians(45), math.radians(15), math.radians(30))
     
     # 2. Fill Light (Area)
     bpy.ops.object.light_add(type='AREA', location=(5, -5, 5))
     fill = bpy.context.object
-    fill.data.energy = 2000.0 # High fill to reduce contrast
+    fill.data.energy = 1000.0 # Reduced fill
     fill.data.size = 10.0
     fill.rotation_euler = (math.radians(60), 0, math.radians(45))
 
@@ -128,7 +140,7 @@ def setup_lighting():
     bpy.ops.object.light_add(type='POINT', location=(0, 0, 0))
     headlight = bpy.context.object
     headlight.name = "Headlight"
-    headlight.data.energy = 800.0 # Moderate headlight
+    headlight.data.energy = 400.0 # Reduced headlight
     headlight.data.shadow_soft_size = 2.0
     
     # Parent to Camera
@@ -145,7 +157,7 @@ def setup_lighting():
     world.use_nodes = True
     bg = world.node_tree.nodes.get('Background')
     if bg:
-        bg.inputs[1].default_value = 6.0 # High ambient to lift shadows
+        bg.inputs[1].default_value = 1.5 # Reduced ambient significantly
 
 def get_camera_pose_matrix(cam_obj):
     """
@@ -183,13 +195,28 @@ def main():
 
     our_args = sys.argv[args_idx:]
     
-    output_dir = our_args[0]
-    num_views = int(our_args[1])
-    image_size = int(our_args[2])
-    scale_adjustment = float(our_args[3])
-    num_sequences = int(our_args[4])
+    # DIFFERENT FROM blender_script.py: First arg is model_path
+    model_path = our_args[0]
+    output_dir = our_args[1]
+    num_views = int(our_args[2])
+    image_size = int(our_args[3])
+    scale_adjustment = float(our_args[4])
+    num_sequences = int(our_args[5])
     
-    # 1. Setup Scene
+    # 0. Clean Default Scene
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete()
+    
+    # 1. Import FBX
+    print(f"Importing FBX: {model_path}")
+    if not os.path.exists(model_path):
+        print(f"Error: FBX file not found at {model_path}")
+        return
+        
+    # use_custom_props=False avoids warnings about unsupported user property types (e.g. 'Short')
+    bpy.ops.import_scene.fbx(filepath=model_path, use_custom_props=False)
+    
+    # 2. Setup Scene
     scene = bpy.context.scene
     scene.render.resolution_x = image_size
     scene.render.resolution_y = image_size
@@ -201,7 +228,7 @@ def main():
     img_dir = os.path.join(output_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
     
-    # 2. Setup Camera
+    # 3. Setup Camera
     # Create Camera FIRST so Headlight can parent to it in setup_lighting
     cam = bpy.data.objects.get("Camera")
     if not cam:
@@ -215,12 +242,14 @@ def main():
     # Setup Compositor for Depth
     depth_node = init_scene(output_dir)
     
-    # 1.5 Setup Lighting
+    # 4. Setup Lighting
     setup_lighting()
 
     # Frame Range
     frame_start = scene.frame_start
     frame_end = scene.frame_end
+    
+    print(f"Animation Frame Range: {frame_start} to {frame_end}")
     
     # Sample random frames for sequences
     # If not enough frames, we might duplicate, but usually 4D assets have many frames.

@@ -112,7 +112,7 @@ def main():
     # User said: "current argument sequence_name should not be used ... each sample time frame will generate dataset under a different sequence name"
     
     # So if Blender, we use args.output_dir/args.category as base, and subfolders will be create dynamically.
-    if args.model_path.lower().endswith('.blend'):
+    if args.model_path.lower().endswith('.blend') or args.model_path.lower().endswith('.fbx'):
         # Use tempfile to create a truly temporary directory that we control
         import tempfile
         
@@ -120,20 +120,39 @@ def main():
         with tempfile.TemporaryDirectory() as temp_build_dir:
             temp_build_dir = os.path.abspath(temp_build_dir) # Use absolute path for Blender
             
-            # .blend execution
-            script_name = "blender_script.py"
-            script_path = os.path.join(os.path.dirname(__file__), script_name)
-            cmd = [
-                args.blender_path,
-                "-b", args.model_path,
-                "-P", script_path,
-                "--",
-                temp_build_dir,
-                str(args.num_views),
-                str(args.image_size),
-                str(args.scale_adjustment),
-                str(args.num_sequences)
-            ]
+            is_fbx = args.model_path.lower().endswith('.fbx')
+            
+            if is_fbx:
+                script_name = "blender_fbx_script.py"
+                script_path = os.path.join(os.path.dirname(__file__), script_name)
+                # For FBX, we run empty blender and import via script
+                cmd = [
+                    args.blender_path,
+                    "-b", 
+                    "-P", script_path,
+                    "--",
+                    args.model_path,   # Arg 0 for script
+                    temp_build_dir,    # Arg 1
+                    str(args.num_views),
+                    str(args.image_size),
+                    str(args.scale_adjustment),
+                    str(args.num_sequences)
+                ]
+            else:
+                # .blend execution
+                script_name = "blender_script.py"
+                script_path = os.path.join(os.path.dirname(__file__), script_name)
+                cmd = [
+                    args.blender_path,
+                    "-b", args.model_path,
+                    "-P", script_path,
+                    "--",
+                    temp_build_dir,
+                    str(args.num_views),
+                    str(args.image_size),
+                    str(args.scale_adjustment),
+                    str(args.num_sequences)
+                ]
             
             print(f"Running Blender ({script_name}): {' '.join(cmd)}")
             try:
@@ -245,7 +264,6 @@ def main():
                     depth_img = depth_img[:, :, 0]
                     
                 depth_map = depth_img
-                # Convert
 
                     
                 # Convert
@@ -344,7 +362,7 @@ def main():
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
-    # Load model (PyRender path)
+    # Load model (PyRender path) for obj and glb files
     scene, bounds, centroid = load_model(args.model_path, normalize=False, scale_adjustment=args.scale_adjustment)
     
     frame_annotations = []
