@@ -156,7 +156,7 @@ def main():
             
             print(f"Running Blender ({script_name}): {' '.join(cmd)}")
             try:
-                import cv2
+                # import cv2  # <--- Removed this stray import that was likely causing issues if cv2 is not in the blender environment
                 subprocess.check_call(cmd)
             except Exception as e:
                 print(f"Blender Execution Error: {e}")
@@ -264,8 +264,11 @@ def main():
                     depth_img = depth_img[:, :, 0]
                     
                 depth_map = depth_img
+                
+                # Zero out background (depth >= 1000 or inf)
+                # Blender clip_end is 1000.0, so valid depth is < 1000.
+                depth_map[depth_map >= 999.0] = 0.0
 
-                    
                 # Convert
                 depth_float16 = depth_map.astype(np.float16)
                 depth_uint16 = np.frombuffer(depth_float16.tobytes(), dtype=np.uint16).reshape(depth_map.shape)
@@ -392,7 +395,7 @@ def main():
     # Radius can be adjusted or made an argument. 
     # For now, we assume the object is roughly unit size and centered.
     # radius = 3.0 
-    elevations = [np.radians(e) for e in [-10, 0, 10, 30]]
+    elevations = [np.radians(e) for e in [-10, 0, 10, 30, 45]]
     
     # We want to loop all views for one elevation first, then move to the next.
     # Total frames = num_views.

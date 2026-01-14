@@ -170,14 +170,26 @@ def get_camera_pose_matrix(cam_obj):
     # m is Matrix(( col0, col1, col2, col3 ))
     # Convert to list of lists [ [r1, r2, r3, tx], ...] or just list of 16
     
-    # Return flat list column-major? Or 4x4 numpy?
-    # Helper expects 4x4 numpy
-    return np.array([
+    # 4x4 Blender Matrix
+    m_np = np.array([
         [m[0][0], m[0][1], m[0][2], m[0][3]],
         [m[1][0], m[1][1], m[1][2], m[1][3]],
         [m[2][0], m[2][1], m[2][2], m[2][3]],
         [m[3][0], m[3][1], m[3][2], m[3][3]]
     ])
+    
+    # Rotate World Coordinate System from Z-up (Blender) to Y-up (OpenGL/PyRender)
+    # Rotation -90 deg around X
+    rot_mat = np.array([
+        [1.0, 0.0,  0.0, 0.0],
+        [0.0, 0.0,  1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0,  0.0, 1.0]
+    ])
+    
+    m_new = rot_mat @ m_np
+    
+    return m_new
 
 def main():
     # Set seed for reproducibility (avoids creating new folders every run if settings change)
@@ -332,28 +344,49 @@ def main():
         seq_name = f"frame_{frame_num:06d}"
         print(f"Generating Sequence: {seq_name} (Frame {frame_num}) - Center: {center}")
 
+        # Define Turntable Views (consistent with generate_dataset.py)
+        elevations = [math.radians(e) for e in [-10, 0, 10, 30, 50]]
+        views_per_elevation = num_views // len(elevations)
+
         for i in range(num_views):
-            # 2. Pick Camera Angle (Turntable)
-            # Random azimuth [0, 2pi]
-            # Random elevation [-10, 30] deg? Or [-30, 60]?
-            azimuth = random.uniform(0, 2 * math.pi)
-            elevation = random.uniform(math.radians(-10), math.radians(45))
+            # 2. Pick Camera Angle (Structured Turntable)
+            # Determine which elevation block we are in
+            elev_idx = i // views_per_elevation
+            # Clamp to last elevation if we have remainder frames
+            if elev_idx >= len(elevations):
+                elev_idx = len(elevations) - 1
+                
+            elevation = elevations[elev_idx]
+            
+            # Azimuth should complete a full circle (or part of it) for EACH elevation
+            # Frame index within this elevation block
+            frame_in_block = i % views_per_elevation
+            if views_per_elevation > 1:
+                azimuth = (2 * math.pi * frame_in_block) / views_per_elevation
+            else:
+                azimuth = 0.0
             
             # Spherical coords
-            x = radius * math.cos(elevation) * math.sin(azimuth)
-            y = radius * math.cos(elevation) * math.cos(azimuth)
+            # Z-up Spherical Conversion:
+            # x = r * cos(elev) * cos(azi)  <-- Correction: Azi 0 is +X axis
+            # y = r * cos(elev) * sin(azi)
+            # z = r * sin(elev)
+            x = radius * math.cos(elevation) * math.cos(azimuth)
+            y = radius * math.cos(elevation) * math.sin(azimuth)
             z = radius * math.sin(elevation)
             
-            # Map to Blender Coords (Assuming Z up? Wait, Blender is Z up).
-            # My renderer_utils was Y up. 
+            # Map to Blender Coords (Assuming Z up).
             # Blender: +X Right, +Y Forward, +Z Up.
-            # Let's use Z-up logic.
             cam_pos = center + np.array([x, y, z])
             
             cam.location = cam_pos
             
             # Look At (track constraint or manual rotation)
+            # direction = Target - Camera
             direction = mathutils.Vector(center - cam_pos)
+            
+            # NOTE: track_quat('-Z', 'Y') might introduce roll or inconsistencies if direct Up alignment isn't perfect.
+            # Using look_at helper equivalent.
             rot_quat = direction.to_track_quat('-Z', 'Y') # Camera looks down -Z, Up is Y
             cam.rotation_euler = rot_quat.to_euler()
             
