@@ -25,9 +25,12 @@ This folder contains tools to generate a CO3D-compatible dataset from a 3D model
    ```bash
    python custom_dataset_generator/src/visualize_cameras.py --annotation_path custom_dataset_generator/output/human_body/frame_annotations.jgz --stride 10
    ```       
+4. Visualize dataset
+   ```bash
+   python custom_dataset_generator/src/visualize_pointcloud.py --dataset_root "custom_dataset_generator/output" --category "human_body_4d_03" --sequence "frame_000028" --stride 10 --show_cameras
+   ```
 
-4. Compare data statistics
+5. Compare data statistics
    ```bash
    python custom_dataset_generator/src/compare_stats.py --files "D:\GitHub\co3d\custom_dataset_generator\assets\rp_dennis_posed_004_OBJ\rp_dennis_posed_004_100k.obj" "D:\GitHub\co3d\custom_dataset_generator\assets\rp_posed_00178_29_GLB\rp_posed_00178_29.glb" "D:\GitHub\co3d\custom_dataset_generator\assets\rp_posedplus_00068_18_300k\rp_posedplus_00068_18_300k.glb"       
-   ```    
-   
+   ```
