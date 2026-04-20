@@ -31,7 +31,17 @@ def load_16big_png_depth(depth_png):
     return depth.astype(np.float32)
 
 
-def unproject_depth_to_pointcloud(depth_map, rgb_image, focal_length, principal_point, R, T, max_depth=None, intrinsics_format="ndc_isotropic"):
+def unproject_depth_to_pointcloud(
+    depth_map,
+    rgb_image,
+    focal_length,
+    principal_point,
+    R,
+    T,
+    max_depth=None,
+    intrinsics_format="ndc_isotropic",
+    camera_convention="pytorch3d",
+):
     """
     Unproject depth map to 3D point cloud using camera parameters.
     
@@ -79,21 +89,28 @@ def unproject_depth_to_pointcloud(depth_map, rgb_image, focal_length, principal_
         fx_px, fy_px = fx, fy
         px_px, py_px = px, py
     
-    # Unproject to camera coordinates
-    # PyTorch3D camera: +X=LEFT, +Y=UP, +Z=FORWARD
-    # Image coords: u right (+x), v down (+y)
-    # Both need negative signs to flip from image to camera coords
-    X_cam = -(u_valid - px_px) * depth_valid / fx_px
-    Y_cam = -(v_valid - py_px) * depth_valid / fy_px
+    # Unproject to camera coordinates according to annotation convention.
+    if camera_convention == "opencv":
+        # OpenCV camera: +X right, +Y down, +Z forward
+        X_cam = (u_valid - px_px) * depth_valid / fx_px
+        Y_cam = (v_valid - py_px) * depth_valid / fy_px
+    else:
+        # PyTorch3D camera: +X left, +Y up, +Z forward
+        X_cam = -(u_valid - px_px) * depth_valid / fx_px
+        Y_cam = -(v_valid - py_px) * depth_valid / fy_px
     Z_cam = depth_valid
     
     points_cam = np.stack([X_cam, Y_cam, Z_cam], axis=1)  # (N, 3)
     
-    # Transform to world coordinates
-    # PyTorch3D convention: X_cam = X_world @ R + T
-    # Inverse: X_world = (X_cam - T) @ R^T
-    points_world = (points_cam - T[None, :]) @ R.T
-    
+    # Transform to world coordinates.
+    if camera_convention == "opencv":
+        # OpenCV convention (column): X_cam = R @ X_world + T
+        # Row form inverse: X_world = (X_cam - T) @ R
+        points_world = (points_cam - T[None, :]) @ R
+    else:
+        # PyTorch3D convention (row): X_cam = X_world @ R + T
+        points_world = (points_cam - T[None, :]) @ R.T
+
     # Extract colors
     colors = rgb_image[valid].astype(np.float32) / 255.0
     
@@ -105,7 +122,17 @@ def unproject_depth_to_pointcloud(depth_map, rgb_image, focal_length, principal_
     return pcd
 
 
-def create_camera_frustum(R, T, focal_length, principal_point, image_size, scale=0.1, color=[1, 0, 0], intrinsics_format="ndc_isotropic"):
+def create_camera_frustum(
+    R,
+    T,
+    focal_length,
+    principal_point,
+    image_size,
+    scale=0.1,
+    color=[1, 0, 0],
+    intrinsics_format="ndc_isotropic",
+    camera_convention="pytorch3d",
+):
     """
     Create a wireframe frustum to visualize a camera in world coordinates.
     
@@ -138,19 +165,29 @@ def create_camera_frustum(R, T, focal_length, principal_point, image_size, scale
     center_cam = np.array([0, 0, 0])
     
     # Image corners in camera coordinates at depth=scale
-    corners_cam = np.array([
-        [-(0 - px) * scale / fx, -(0 - py) * scale / fy, scale],      # Top-left
-        [-(W - px) * scale / fx, -(0 - py) * scale / fy, scale],      # Top-right
-        [-(W - px) * scale / fx, -(H - py) * scale / fy, scale],      # Bottom-right
-        [-(0 - px) * scale / fx, -(H - py) * scale / fy, scale],      # Bottom-left
-    ])
-    
-    # Transform to world coordinates
-    # PyTorch3D convention: X_cam = X_world @ R + T
-    # Inverse: X_world = (X_cam - T) @ R^T
-    center_world = -T @ R.T
-    corners_world = (corners_cam - T[None, :]) @ R.T
-    
+    if camera_convention == "opencv":
+        corners_cam = np.array([
+            [(0 - px) * scale / fx, (0 - py) * scale / fy, scale],      # Top-left
+            [(W - px) * scale / fx, (0 - py) * scale / fy, scale],      # Top-right
+            [(W - px) * scale / fx, (H - py) * scale / fy, scale],      # Bottom-right
+            [(0 - px) * scale / fx, (H - py) * scale / fy, scale],      # Bottom-left
+        ])
+    else:
+        corners_cam = np.array([
+            [-(0 - px) * scale / fx, -(0 - py) * scale / fy, scale],      # Top-left
+            [-(W - px) * scale / fx, -(0 - py) * scale / fy, scale],      # Top-right
+            [-(W - px) * scale / fx, -(H - py) * scale / fy, scale],      # Bottom-right
+            [-(0 - px) * scale / fx, -(H - py) * scale / fy, scale],      # Bottom-left
+        ])
+
+    # Transform to world coordinates.
+    if camera_convention == "opencv":
+        center_world = -T @ R
+        corners_world = (corners_cam - T[None, :]) @ R
+    else:
+        center_world = -T @ R.T
+        corners_world = (corners_cam - T[None, :]) @ R.T
+
     # Create frustum geometry
     points = np.vstack([center_world[None, :], corners_world])
     
@@ -167,7 +204,7 @@ def create_camera_frustum(R, T, focal_length, principal_point, image_size, scale
     return line_set
 
 
-def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True):
+def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, viewpoint_format="auto"):
     """
     Visualize a single frame as a point cloud.
     
@@ -209,12 +246,23 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True):
     R = np.array(viewpoint['R'])
     T = np.array(viewpoint['T'])
     intrinsics_format = viewpoint.get('intrinsics_format', 'ndc_isotropic')
-    
+    if viewpoint_format == "opencv":
+        camera_convention = "opencv"
+    elif viewpoint_format == "pytorch3d":
+        camera_convention = "pytorch3d"
+    else:
+        conv_tag = str(viewpoint.get('camera_convention', '')).lower()
+        if 'opencv' in conv_tag or intrinsics_format == 'opencv_pixels':
+            camera_convention = "opencv"
+        else:
+            camera_convention = "pytorch3d"
+
     print(f"Frame: {annotation['image']['path']}")
     print(f"  RGB shape: {rgb_img.shape}")
     print(f"  Depth range: [{depth_metric.min():.3f}, {depth_metric.max():.3f}] meters")
     print(f"  Valid depth pixels: {(depth_metric > 0).sum()} / {depth_metric.size}")
-    
+    print(f"  Camera convention: {camera_convention}")
+
     # Create point cloud
     pcd = unproject_depth_to_pointcloud(
         depth_metric, 
@@ -223,7 +271,8 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True):
         principal_point, 
         R, T,
         max_depth=max_depth,
-        intrinsics_format=intrinsics_format
+        intrinsics_format=intrinsics_format,
+        camera_convention=camera_convention,
     )
     
     print(f"  Point cloud: {len(pcd.points)} points")
@@ -237,13 +286,22 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True):
         frustum_scale = 0.02  # 2cm frustum for visualization
         frustum = create_camera_frustum(R, T, focal_length, principal_point, (W, H), 
                                        scale=frustum_scale, color=[1, 0, 0], 
-                                       intrinsics_format=intrinsics_format)
+                                       intrinsics_format=intrinsics_format,
+                                       camera_convention=camera_convention)
         geometries.append(frustum)
     
     return geometries
 
 
-def visualize_sequence(annotations, dataset_root, sequence_name, stride=1, max_depth=10.0, show_cameras=True):
+def visualize_sequence(
+    annotations,
+    dataset_root,
+    sequence_name,
+    stride=1,
+    max_depth=10.0,
+    show_cameras=True,
+    viewpoint_format="auto",
+):
     """
     Visualize multiple frames from a sequence as a combined point cloud.
     
@@ -272,7 +330,13 @@ def visualize_sequence(annotations, dataset_root, sequence_name, stride=1, max_d
     
     for i, anno in enumerate(sequence_frames[::stride]):
         print(f"\nProcessing frame {i * stride + 1}/{len(sequence_frames)}...")
-        geometries = visualize_frame(anno, dataset_root, max_depth=max_depth, show_camera=show_cameras)
+        geometries = visualize_frame(
+            anno,
+            dataset_root,
+            max_depth=max_depth,
+            show_camera=show_cameras,
+            viewpoint_format=viewpoint_format,
+        )
         all_geometries.extend(geometries)
     
     return all_geometries
@@ -296,7 +360,14 @@ def main():
                         help="Show camera frustums")
     parser.add_argument("--output", type=str, default=None,
                         help="Save point cloud to file (e.g., output.ply)")
-    
+    parser.add_argument(
+        "--viewpoint_format",
+        type=str,
+        default="auto",
+        choices=["auto", "pytorch3d", "opencv"],
+        help="Camera convention in annotations; 'auto' uses metadata/intrinsics format",
+    )
+
     args = parser.parse_args()
     
     # Construct annotation path from dataset_root and category
@@ -318,14 +389,16 @@ def main():
         
         print(f"\nVisualizing frame {args.frame_idx}...")
         geometries = visualize_frame(annotations[args.frame_idx], args.dataset_root, 
-                                      max_depth=args.max_depth, show_camera=args.show_cameras)
-    
+                                      max_depth=args.max_depth, show_camera=args.show_cameras,
+                                      viewpoint_format=args.viewpoint_format)
+
     elif args.sequence is not None:
         # Visualize sequence
         geometries = visualize_sequence(annotations, args.dataset_root, args.sequence,
                                         stride=args.stride, max_depth=args.max_depth,
-                                        show_cameras=args.show_cameras)
-    
+                                        show_cameras=args.show_cameras,
+                                        viewpoint_format=args.viewpoint_format)
+
     else:
         print("Error: Must specify either --frame_idx or --sequence")
         return

@@ -214,7 +214,7 @@ def main():
     image_size = int(our_args[3])
     scale_adjustment = float(our_args[4])
     num_sequences = int(our_args[5])
-    
+
     # 0. Clean Default Scene
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete()

@@ -20,7 +20,31 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 # Import renderer utils
-from renderer_utils import load_model, get_camera_pose, render_view, get_co3d_viewpoint
+from renderer_utils import load_model, get_camera_pose, render_view, get_co3d_viewpoint, get_opencv_w2c
+
+
+def make_pytorch3d_viewpoint(c2w, focal_length_ndc):
+    R, T = get_co3d_viewpoint(c2w)
+    return {
+        "R": R,
+        "T": T,
+        "focal_length": [focal_length_ndc, focal_length_ndc],
+        "principal_point": [0.0, 0.0],
+        "intrinsics_format": "ndc_isotropic",
+    }
+
+
+def make_opencv_viewpoint(c2w, image_size, focal_length_px):
+    R, T = get_opencv_w2c(c2w)
+    principal = (image_size - 1) / 2.0
+    return {
+        "R": R,
+        "T": T,
+        "focal_length": [focal_length_px, focal_length_px],
+        "principal_point": [principal, principal],
+        "intrinsics_format": "opencv_pixels",
+        "camera_convention": "opencv_w2c",
+    }
 
 def load_jgz(path):
     if not os.path.exists(path):
@@ -91,7 +115,14 @@ def main():
     parser.add_argument("--scale_adjustment", type=float, default=1.0, help="Manual scale adjustment factor (default 1.0)")
     parser.add_argument("--blender_path", type=str, default="blender", help="Path to blender executable")
     parser.add_argument("--num_sequences", type=int, default=1, help="Number of random time sequences to generate (Blender only)")
-    
+    parser.add_argument(
+        "--annotation_format",
+        type=str,
+        default="pytorch3d",
+        choices=["pytorch3d", "opencv", "both"],
+        help="Annotation viewpoint convention to export",
+    )
+
     args = parser.parse_args()
     
     print(f"Generating dataset for {args.model_path}...")
@@ -171,7 +202,8 @@ def main():
             with open(meta_path, "r") as f:
                 meta_data = json.load(f)
                 
-            all_frame_annotations = []
+            all_frame_annotations_pt3d = []
+            all_frame_annotations_opencv = []
             unique_sequences = set()
             
             print("Processing Blender outputs...")
@@ -290,8 +322,7 @@ def main():
                 
                 # Annotations
                 c2w = np.array(meta['c2w_matrix'])
-                R, T = get_co3d_viewpoint(c2w)
-                
+
                 # Calculate Focal Length
                 # Prefer metadata values if available (from Blender)
                 if 'focal_length' in meta and 'sensor_width' in meta:
@@ -300,6 +331,7 @@ def main():
                     # Focal length in NDC: fx_ndc = 2 * fl_mm / sw_mm
                     if sw_mm > 0:
                         focal_length_ndc = 2.0 * fl_mm / sw_mm
+                        focal_length_px = (fl_mm / sw_mm) * args.image_size
                     else:
                         yfov = np.radians(60.0)
                         focal_length_px = (args.image_size / 2.0) / np.tan(yfov / 2.0)
@@ -308,24 +340,27 @@ def main():
                     yfov = np.radians(60.0)
                     focal_length_px = (args.image_size / 2.0) / np.tan(yfov / 2.0)
                     focal_length_ndc = focal_length_px / (args.image_size / 2.0)
-                
-                frame_ann = {
+
+                frame_ann_base = {
                     "sequence_name": seq_name,
                     "frame_number": meta['index'], # Index within SEQUENCE
                     "frame_timestamp": meta['timestamp'],
                     "image": {"path": dst_img_rel, "size": [args.image_size, args.image_size]},
                     "depth": {"path": dst_depth_rel, "scale_adjustment": 1.0, "mask_path": dst_dmask_rel},
                     "mask": {"path": dst_mask_rel, "mass": float(np.sum(mask) / 255.0)},
-                    "viewpoint": {
-                        "R": R, "T": T,
-                        "focal_length": [focal_length_ndc, focal_length_ndc],
-                        "principal_point": [0.0, 0.0],
-                        "intrinsics_format": "ndc_isotropic"
-                    },
                     "meta": {"original_frame": meta['frame_number']}
                 }
-                all_frame_annotations.append(frame_ann)
-                
+
+                if args.annotation_format in ("pytorch3d", "both"):
+                    frame_ann_pt3d = dict(frame_ann_base)
+                    frame_ann_pt3d["viewpoint"] = make_pytorch3d_viewpoint(c2w, focal_length_ndc)
+                    all_frame_annotations_pt3d.append(frame_ann_pt3d)
+
+                if args.annotation_format in ("opencv", "both"):
+                    frame_ann_cv = dict(frame_ann_base)
+                    frame_ann_cv["viewpoint"] = make_opencv_viewpoint(c2w, args.image_size, focal_length_px)
+                    all_frame_annotations_opencv.append(frame_ann_cv)
+
             # Cleanup - HANDLED BY CONTEXT MANAGER
             print(f"Debug: cleaned up temp build dir")
         
@@ -333,9 +368,18 @@ def main():
         print("Saving Blender annotations...")
         
         # Frame Annotations (Global for category)
-        ann_path = os.path.join(args.output_dir, args.category, "frame_annotations.jgz")
-        append_and_save_jgz(all_frame_annotations, ann_path)
-        
+        if args.annotation_format == "pytorch3d":
+            ann_path = os.path.join(args.output_dir, args.category, "frame_annotations.jgz")
+            append_and_save_jgz(all_frame_annotations_pt3d, ann_path)
+        elif args.annotation_format == "opencv":
+            ann_path = os.path.join(args.output_dir, args.category, "frame_annotations.jgz")
+            append_and_save_jgz(all_frame_annotations_opencv, ann_path)
+        else:
+            ann_path = os.path.join(args.output_dir, args.category, "frame_annotations.jgz")
+            ann_cv_path = os.path.join(args.output_dir, args.category, "frame_annotations_opencv.jgz")
+            append_and_save_jgz(all_frame_annotations_pt3d, ann_path)
+            append_and_save_jgz(all_frame_annotations_opencv, ann_cv_path)
+
         # Sequence Annotations
         seq_ann_path = os.path.join(args.output_dir, args.category, "sequence_annotations.jgz")
         seq_ann = []
@@ -352,7 +396,8 @@ def main():
         os.makedirs(set_lists_dir, exist_ok=True)
         
         set_list_data = []
-        for ann in all_frame_annotations:
+        set_list_source = all_frame_annotations_pt3d if all_frame_annotations_pt3d else all_frame_annotations_opencv
+        for ann in set_list_source:
              set_list_data.append((ann["sequence_name"], ann["frame_number"], ann["image"]["path"]))
              
         set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")
@@ -368,8 +413,9 @@ def main():
     # Load model (PyRender path) for obj and glb files
     scene, bounds, centroid = load_model(args.model_path, normalize=False, scale_adjustment=args.scale_adjustment)
     
-    frame_annotations = []
-    
+    frame_annotations_pt3d = []
+    frame_annotations_opencv = []
+
     # Calculate optimal camera distance
 
     # bounds is 2x3 [[min_x, min_y, min_z], [max_x, max_y, max_z]]
@@ -459,10 +505,6 @@ def main():
         depth_mask_path_abs = os.path.join(args.output_dir, depth_mask_path_rel)
         Image.fromarray(mask).save(depth_mask_path_abs)
         
-        # Calculate Viewpoint Annotation
-        # Use the helper from renderer_utils to convert OpenGL pose to CO3D format
-        R, T = get_co3d_viewpoint(c2w)
-        
         # Focal length and principal point
         # PyRender PerspectiveCamera: yfov is vertical FOV.
         # f_y = (H / 2) / tan(yfov / 2)
@@ -474,11 +516,8 @@ def main():
         # For square images, ndc_isotropic is the same as normalizing by half image size
         # focal_length_ndc = focal_length_px / (image_size / 2)
         focal_length_ndc = focal_length_px / (args.image_size / 2.0)
-        
-        # Principal point is usually center
-        principal_point_ndc = [0.0, 0.0]
-        
-        frame_ann = {
+
+        frame_ann_base = {
             "sequence_name": args.sequence_name,
             "frame_number": frame_num,
             "frame_timestamp": float(frame_num) / 30.0, # Assuming 30fps
@@ -494,23 +533,34 @@ def main():
             "mask": {
                 "path": mask_path_rel,
                 "mass": float(np.sum(mask) / 255.0)
-            },
-            "viewpoint": {
-                "R": R,
-                "T": T,
-                "focal_length": [focal_length_ndc, focal_length_ndc],
-                "principal_point": principal_point_ndc,
-                "intrinsics_format": "ndc_isotropic"
             }
         }
-        frame_annotations.append(frame_ann)
+
+        if args.annotation_format in ("pytorch3d", "both"):
+            frame_ann_pt3d = dict(frame_ann_base)
+            frame_ann_pt3d["viewpoint"] = make_pytorch3d_viewpoint(c2w, focal_length_ndc)
+            frame_annotations_pt3d.append(frame_ann_pt3d)
+
+        if args.annotation_format in ("opencv", "both"):
+            frame_ann_cv = dict(frame_ann_base)
+            frame_ann_cv["viewpoint"] = make_opencv_viewpoint(c2w, args.image_size, focal_length_px)
+            frame_annotations_opencv.append(frame_ann_cv)
 
     # Save Frame Annotations
     # CO3D stores all frame annotations for a category in one file usually.
     cat_dir = os.path.join(args.output_dir, args.category)
-    frame_ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
-    append_and_save_jgz(frame_annotations, frame_ann_path)
-    
+    if args.annotation_format == "pytorch3d":
+        frame_ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
+        append_and_save_jgz(frame_annotations_pt3d, frame_ann_path)
+    elif args.annotation_format == "opencv":
+        frame_ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
+        append_and_save_jgz(frame_annotations_opencv, frame_ann_path)
+    else:
+        frame_ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
+        frame_ann_cv_path = os.path.join(cat_dir, "frame_annotations_opencv.jgz")
+        append_and_save_jgz(frame_annotations_pt3d, frame_ann_path)
+        append_and_save_jgz(frame_annotations_opencv, frame_ann_cv_path)
+
     # Save Sequence Annotations
     seq_ann = {
         "sequence_name": args.sequence_name,
@@ -527,7 +577,7 @@ def main():
     
     set_list_data = [
         (args.sequence_name, i, ann["image"]["path"]) 
-        for i, ann in enumerate(frame_annotations)
+        for i, ann in enumerate(frame_annotations_pt3d if frame_annotations_pt3d else frame_annotations_opencv)
     ]
     
     set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")

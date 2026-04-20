@@ -320,3 +320,32 @@ def get_co3d_viewpoint(camera_pose_gl):
     R_w2c_pt3d_rowmajor = R_w2c_pt3d_colmajor.T
     
     return R_w2c_pt3d_rowmajor.tolist(), T_w2c_pt3d.tolist()
+
+
+def get_opencv_w2c(camera_pose_gl):
+    """
+    Convert an OpenGL camera pose (Camera-to-World) to OpenCV world-to-camera extrinsics.
+
+    OpenGL camera coordinates: +X right, +Y up, -Z forward
+    OpenCV camera coordinates: +X right, +Y down, +Z forward
+
+    Args:
+        camera_pose_gl: 4x4 OpenGL Camera-to-World matrix
+
+    Returns:
+        R: 3x3 world-to-camera rotation matrix (column-vector convention)
+        t: 3-element world-to-camera translation vector
+    """
+    c2w_gl = camera_pose_gl
+    w2c_gl = np.linalg.inv(c2w_gl)
+
+    R_w2c_gl = w2c_gl[:3, :3]
+    t_w2c_gl = w2c_gl[:3, 3]
+
+    # Convert camera coordinates from OpenGL to OpenCV by flipping Y and Z.
+    S_cam = np.diag([1.0, -1.0, -1.0])
+    R_w2c_cv = S_cam @ R_w2c_gl
+    t_w2c_cv = S_cam @ t_w2c_gl
+
+    return R_w2c_cv.tolist(), t_w2c_cv.tolist()
+

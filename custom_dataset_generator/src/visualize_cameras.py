@@ -71,6 +71,13 @@ def main():
     parser.add_argument("--annotation_path", type=str, required=True, help="Path to frame_annotations.jgz")
     parser.add_argument("--scale", type=float, default=0.5, help="Scale of camera frustums")
     parser.add_argument("--stride", type=int, default=1, help="Show every Nth camera")
+    parser.add_argument(
+        "--viewpoint_format",
+        type=str,
+        default="pytorch3d",
+        choices=["pytorch3d", "opencv"],
+        help="Viewpoint convention used in annotation file",
+    )
     args = parser.parse_args()
 
     print(f"Loading annotations from {args.annotation_path}...")
@@ -84,8 +91,12 @@ def main():
         if vp:
             R = np.array(vp['R'])
             T = np.array(vp['T'])
-            # C = -T @ R.T
-            C = -np.dot(T, R.T)
+            if args.viewpoint_format == "pytorch3d":
+                # Row-vector world-to-camera: X_cam = X_world @ R + T
+                C = -np.dot(T, R.T)
+            else:
+                # Column-vector world-to-camera: X_cam = R @ X_world + T
+                C = -np.dot(R.T, T)
             distances.append(np.linalg.norm(C))
             
     if distances:
@@ -116,29 +127,17 @@ def main():
         if not vp:
             continue
             
-        # R and T from annotation
-        # R is Row-Major World-to-Camera Rotation (M[:3, :3])
-        # T is Row-Major World-to-Camera Translation (M[3, :3])
-        R_row = np.array(vp['R'])
-        T_row = np.array(vp['T'])
-        
-        # Construct the Row-Major World-to-Camera Matrix M_row
-        # M_row = [[R00, R01, R02, 0],
-        #          [R10, R11, R12, 0],
-        #          [R20, R21, R22, 0],
-        #          [Tx,  Ty,  Tz,  1]]
-        # But standard linear algebra usually works with Column-Major matrices for transformation logic:
-        # M_col = M_row.T
-        
-        # Let's work with Column-Major matrices for Open3D
-        # M_col = [[R00, R10, R20, Tx],
-        #          [R01, R11, R21, Ty],
-        #          [R02, R12, R22, Tz],
-        #          [0,   0,   0,   1]]
-        
-        R_col = R_row.T
-        T_col = T_row.T # T_row is 1D array, so T_col is just the vector
-        
+        if args.viewpoint_format == "pytorch3d":
+            # PyTorch3D stores row-vector world-to-camera transforms.
+            R_row = np.array(vp['R'])
+            T_row = np.array(vp['T'])
+            R_col = R_row.T
+            T_col = T_row.T
+        else:
+            # OpenCV stores column-vector world-to-camera transforms directly.
+            R_col = np.array(vp['R'])
+            T_col = np.array(vp['T'])
+
         # World-to-Camera Matrix (Column-Major)
         w2c = np.eye(4)
         w2c[:3, :3] = R_col
@@ -179,7 +178,7 @@ def main():
 
     # Visualize
     print("Visualizing... (Close the window to exit)")
-    o3d.visualization.draw_geometries(geometries, window_name="CO3D Camera Poses")
+    o3d.visualization.draw_geometries(geometries, window_name=f"Camera Poses ({args.viewpoint_format})")
 
 if __name__ == "__main__":
     main()
