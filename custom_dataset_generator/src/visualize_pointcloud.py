@@ -41,6 +41,7 @@ def unproject_depth_to_pointcloud(
     max_depth=None,
     intrinsics_format="ndc_isotropic",
     camera_convention="pytorch3d",
+    mask=None,
 ):
     """
     Unproject depth map to 3D point cloud using camera parameters.
@@ -54,6 +55,7 @@ def unproject_depth_to_pointcloud(
         T: (3,) translation vector (world to camera)
         max_depth: Maximum depth to include (filter far points)
         intrinsics_format: "ndc_isotropic" or "pixel"
+        mask: optional (H, W) uint8 array; non-zero pixels are foreground
     
     Returns:
         Open3D PointCloud object
@@ -67,6 +69,8 @@ def unproject_depth_to_pointcloud(
     valid = (depth_map > 0) & np.isfinite(depth_map)
     if max_depth is not None:
         valid = valid & (depth_map < max_depth)
+    if mask is not None:
+        valid = valid & (mask > 0)
     
     # Extract valid pixels
     u_valid = u[valid]
@@ -204,7 +208,7 @@ def create_camera_frustum(
     return line_set
 
 
-def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, viewpoint_format="auto"):
+def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, viewpoint_format="auto", use_mask=False):
     """
     Visualize a single frame as a point cloud.
     
@@ -213,6 +217,7 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, 
         dataset_root: Root directory of the dataset
         max_depth: Maximum depth to include
         show_camera: Whether to show camera frustum
+        use_mask: If True, load the mask PNG from annotation and restrict points to foreground
     
     Returns:
         List of Open3D geometries to visualize
@@ -238,6 +243,15 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, 
     if (depth_metric > 0).sum() == 0:
         print(f"Warning: No valid depth in frame {annotation['image']['path']}")
         return []
+
+    # Load mask if requested
+    mask_img = None
+    if use_mask and 'mask' in annotation and 'path' in annotation['mask']:
+        mask_path = os.path.join(dataset_root, annotation['mask']['path'])
+        if os.path.exists(mask_path):
+            mask_img = np.array(Image.open(mask_path).convert('L'))
+        else:
+            print(f"  Warning: mask not found: {mask_path}")
     
     # Get camera parameters
     viewpoint = annotation['viewpoint']
@@ -262,6 +276,8 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, 
     print(f"  Depth range: [{depth_metric.min():.3f}, {depth_metric.max():.3f}] meters")
     print(f"  Valid depth pixels: {(depth_metric > 0).sum()} / {depth_metric.size}")
     print(f"  Camera convention: {camera_convention}")
+    if mask_img is not None:
+        print(f"  Mask foreground pixels: {(mask_img > 0).sum()} / {mask_img.size}")
 
     # Create point cloud
     pcd = unproject_depth_to_pointcloud(
@@ -273,6 +289,7 @@ def visualize_frame(annotation, dataset_root, max_depth=10.0, show_camera=True, 
         max_depth=max_depth,
         intrinsics_format=intrinsics_format,
         camera_convention=camera_convention,
+        mask=mask_img,
     )
     
     print(f"  Point cloud: {len(pcd.points)} points")
@@ -301,6 +318,7 @@ def visualize_sequence(
     max_depth=10.0,
     show_cameras=True,
     viewpoint_format="auto",
+    use_mask=False,
 ):
     """
     Visualize multiple frames from a sequence as a combined point cloud.
@@ -336,6 +354,7 @@ def visualize_sequence(
             max_depth=max_depth,
             show_camera=show_cameras,
             viewpoint_format=viewpoint_format,
+            use_mask=use_mask,
         )
         all_geometries.extend(geometries)
     
@@ -358,6 +377,8 @@ def main():
                         help="Maximum depth to include (meters)")
     parser.add_argument("--show_cameras", action="store_true",
                         help="Show camera frustums")
+    parser.add_argument("--use_mask", action="store_true",
+                        help="Apply mask PNG from annotations to restrict points to foreground")
     parser.add_argument("--output", type=str, default=None,
                         help="Save point cloud to file (e.g., output.ply)")
     parser.add_argument(
@@ -390,14 +411,16 @@ def main():
         print(f"\nVisualizing frame {args.frame_idx}...")
         geometries = visualize_frame(annotations[args.frame_idx], args.dataset_root, 
                                       max_depth=args.max_depth, show_camera=args.show_cameras,
-                                      viewpoint_format=args.viewpoint_format)
+                                      viewpoint_format=args.viewpoint_format,
+                                      use_mask=args.use_mask)
 
     elif args.sequence is not None:
         # Visualize sequence
         geometries = visualize_sequence(annotations, args.dataset_root, args.sequence,
                                         stride=args.stride, max_depth=args.max_depth,
                                         show_cameras=args.show_cameras,
-                                        viewpoint_format=args.viewpoint_format)
+                                        viewpoint_format=args.viewpoint_format,
+                                        use_mask=args.use_mask)
 
     else:
         print("Error: Must specify either --frame_idx or --sequence")

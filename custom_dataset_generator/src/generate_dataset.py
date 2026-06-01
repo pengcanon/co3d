@@ -21,6 +21,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 
 # Import renderer utils
 from renderer_utils import load_model, get_camera_pose, render_view, get_co3d_viewpoint, get_opencv_w2c
+# Import splat pipeline (lazy import inside branch to avoid mandatory torch dependency)
+# from splat_script import generate_splat_dataset
 
 
 def make_pytorch3d_viewpoint(c2w, focal_length_ndc):
@@ -143,6 +145,160 @@ def main():
     # User said: "current argument sequence_name should not be used ... each sample time frame will generate dataset under a different sequence name"
     
     # So if Blender, we use args.output_dir/args.category as base, and subfolders will be create dynamically.
+
+    # ── Splat folder pipeline ─────────────────────────────────────────────────────
+    # When model_path is a directory, walk each sub-folder, find its ply/ sub-directory,
+    # and treat the sequence of numbered .ply files as either a static pose or a video.
+    # All subjects share one category (args.category); sequence names embed the subject id.
+    if os.path.isdir(args.model_path):
+        from splat_script import generate_splat_dataset
+
+        VIDEO_THRESHOLD = 20   # More than this many frames -> treat as video
+
+        cat_dir = os.path.join(args.output_dir, args.category)
+        all_frame_annotations = []
+
+        # Collect all sub-folder IDs (direct children with a ply/ sub-folder)
+        subject_dirs = sorted([
+            d for d in os.listdir(args.model_path)
+            if os.path.isdir(os.path.join(args.model_path, d, 'ply'))
+        ])
+
+        if not subject_dirs:
+            # Fallback: the directory itself may be a single subject (has ply/ directly)
+            if os.path.isdir(os.path.join(args.model_path, 'ply')):
+                subject_dirs = ['.']
+            else:
+                print(f"Error: No sub-folders with a ply/ directory found in {args.model_path}")
+                return
+
+        print(f"Found {len(subject_dirs)} subject(s): {subject_dirs}")
+
+        total_sequences = 0
+
+        for subject_id in subject_dirs:
+            if subject_id == '.':
+                ply_dir = os.path.join(args.model_path, 'ply')
+                subject_id = os.path.basename(os.path.abspath(args.model_path))
+            else:
+                ply_dir = os.path.join(args.model_path, subject_id, 'ply')
+
+            # Sort .ply files numerically by stem
+            ply_files = sorted(
+                [f for f in os.listdir(ply_dir) if f.lower().endswith('.ply')],
+                key=lambda f: int(os.path.splitext(f)[0])
+            )
+
+            if not ply_files:
+                print(f"  [{subject_id}] No .ply files found, skipping.")
+                continue
+
+            num_frames = len(ply_files)
+            print(f"\n  [{subject_id}] {num_frames} PLY frame(s) - "
+                  f"{'video' if num_frames > VIDEO_THRESHOLD else 'static'}")
+
+            if num_frames <= VIDEO_THRESHOLD:
+                # ── Static: use only the first frame ──────────────────────────
+                ply_path = os.path.join(ply_dir, ply_files[0])
+                seq_name = subject_id
+                frame_anns = generate_splat_dataset(
+                    ply_path=ply_path,
+                    output_dir=args.output_dir,
+                    category=args.category,
+                    sequence_name=seq_name,
+                    num_views=args.num_views,
+                    image_size=args.image_size,
+                )
+                all_frame_annotations.extend(frame_anns)
+                total_sequences += 1
+
+            else:
+                # ── Video: pick num_sequences evenly-spaced frames ─────────────
+                if args.num_sequences <= 1:
+                    indices = [0]
+                else:
+                    step = (num_frames - 1) / (args.num_sequences - 1)
+                    indices = [round(i * step) for i in range(args.num_sequences)]
+                    indices = sorted(set(indices))  # deduplicate
+
+                for frame_idx in indices:
+                    ply_path = os.path.join(ply_dir, ply_files[frame_idx])
+                    seq_name = f"{subject_id}_frame{frame_idx:04d}"
+                    print(f"    Rendering sequence '{seq_name}' from {ply_files[frame_idx]}...")
+                    frame_anns = generate_splat_dataset(
+                        ply_path=ply_path,
+                        output_dir=args.output_dir,
+                        category=args.category,
+                        sequence_name=seq_name,
+                        num_views=args.num_views,
+                        image_size=args.image_size,
+                    )
+                    all_frame_annotations.extend(frame_anns)
+                    total_sequences += 1
+
+            print(f"  [{subject_id}] Done.")
+
+        # ── Save shared category annotations ──────────────────────────────────
+        ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
+        append_and_save_jgz(all_frame_annotations, ann_path)
+
+        seq_names = list({a["sequence_name"] for a in all_frame_annotations})
+        seq_ann_path = os.path.join(cat_dir, "sequence_annotations.jgz")
+        append_and_save_jgz(
+            [{"sequence_name": s, "category": args.category, "viewpoint_quality_score": 1.0}
+             for s in seq_names],
+            seq_ann_path, key_field="sequence_name"
+        )
+
+        set_lists_dir = os.path.join(cat_dir, "set_lists")
+        os.makedirs(set_lists_dir, exist_ok=True)
+        set_list_data = [(a["sequence_name"], a["frame_number"], a["image"]["path"])
+                         for a in all_frame_annotations]
+        set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")
+        append_and_save_json(set_list_data, set_list_path)
+
+        print(f"\nDataset generation complete (Splat Folder Pipeline). "
+              f"{len(subject_dirs)} subject(s), {total_sequences} sequence(s), "
+              f"{len(all_frame_annotations)} total frames.")
+        return
+
+    # ── Splat (.ply) pipeline ──────────────────────────────────────────────────────
+    if args.model_path.lower().endswith('.ply'):
+        from splat_script import generate_splat_dataset
+
+        frame_annotations = generate_splat_dataset(
+            ply_path=args.model_path,
+            output_dir=args.output_dir,
+            category=args.category,
+            sequence_name=args.sequence_name,
+            num_views=args.num_views,
+            image_size=args.image_size,
+        )
+
+        cat_dir = os.path.join(args.output_dir, args.category)
+
+        # Frame annotations — always OpenCV for splat pipeline
+        ann_path = os.path.join(cat_dir, "frame_annotations.jgz")
+        append_and_save_jgz(frame_annotations, ann_path)
+
+        # Sequence annotations
+        seq_ann_path = os.path.join(cat_dir, "sequence_annotations.jgz")
+        append_and_save_jgz(
+            [{"sequence_name": args.sequence_name, "category": args.category, "viewpoint_quality_score": 1.0}],
+            seq_ann_path, key_field="sequence_name"
+        )
+
+        # Set lists
+        set_lists_dir = os.path.join(cat_dir, "set_lists")
+        os.makedirs(set_lists_dir, exist_ok=True)
+        set_list_data = [(ann["sequence_name"], ann["frame_number"], ann["image"]["path"]) for ann in frame_annotations]
+        set_list_path = os.path.join(set_lists_dir, "set_lists_manyview_dev_0.json")
+        append_and_save_json(set_list_data, set_list_path)
+
+        print(f"Dataset generation complete (Splat Pipeline). Generated {len(frame_annotations)} frames.")
+        return
+
+    # ── Blender pipeline ────────────────────────────────────────────────────────
     if args.model_path.lower().endswith('.blend') or args.model_path.lower().endswith('.fbx'):
         # Use tempfile to create a truly temporary directory that we control
         import tempfile
